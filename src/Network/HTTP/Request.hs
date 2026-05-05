@@ -182,6 +182,17 @@ data Method
   | Method String
   deriving (Show, Eq)
 
+methodToByteString :: Method -> BS.ByteString
+methodToByteString DELETE = "DELETE"
+methodToByteString GET = "GET"
+methodToByteString HEAD = "HEAD"
+methodToByteString OPTIONS = "OPTIONS"
+methodToByteString PATCH = "PATCH"
+methodToByteString POST = "POST"
+methodToByteString PUT = "PUT"
+methodToByteString TRACE = "TRACE"
+methodToByteString (Method m) = C.pack m
+
 data Request a = Request
   { method :: Method,
     url :: String,
@@ -218,7 +229,7 @@ toLowlevelRequest req = do
           else [("User-Agent", defaultUserAgent)]
   return $
     initReq
-      { LowLevelClient.method = C.pack . show $ req.method,
+      { LowLevelClient.method = methodToByteString req.method,
         LowLevelClient.requestHeaders = map (\(k, v) -> (CI.mk k, v)) (req.headers ++ extraContentType ++ extraUserAgent),
         LowLevelClient.requestBody = LowLevelClient.RequestBodyBS (toRequestBody req.body)
       }
