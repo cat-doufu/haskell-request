@@ -87,20 +87,42 @@ data SseEvent = SseEvent
   }
   deriving (Show)
 
-extractSseEvent :: T.Text -> Maybe (SseEvent, T.Text)
-extractSseEvent buf =
-  case T.breakOn "\n\n" buf of
-    (_, rest) | T.null rest -> Nothing
-    (block, rest) ->
-      let remaining = T.drop 2 rest
-          ls = T.lines block
-          getData l = if "data: " `T.isPrefixOf` l then Just (T.drop 6 l) else Nothing
-          getType l = if "event: " `T.isPrefixOf` l then Just (T.drop 7 l) else Nothing
-          getId l = if "id: " `T.isPrefixOf` l then Just (T.drop 4 l) else Nothing
-          dataVal = T.intercalate "\n" . mapMaybe getData $ ls
-          typeVal = listToMaybe . mapMaybe getType $ ls
-          idVal = listToMaybe . mapMaybe getId $ ls
-       in Just (SseEvent dataVal typeVal idVal, remaining)
+findEventSep :: BS.ByteString -> Maybe (Int, Int)
+findEventSep bs = foldr earlier Nothing
+  [ tryFind "\r\n\r\n" 4
+  , tryFind "\n\n" 2
+  , tryFind "\r\r" 2
+  ]
+  where
+    tryFind pat sepLen =
+      let (h, t) = BS.breakSubstring pat bs
+       in if BS.null t then Nothing else Just (BS.length h, BS.length h + sepLen)
+    earlier a Nothing = a
+    earlier Nothing b = b
+    earlier a@(Just (s1, _)) b@(Just (s2, _)) = if s1 <= s2 then a else b
+
+parseSseField :: T.Text -> Maybe (T.Text, T.Text)
+parseSseField line
+  | T.null line = Nothing
+  | T.head line == ':' = Nothing
+  | otherwise =
+      let (name, rest) = T.breakOn ":" line
+          value
+            | T.null rest = ""
+            | otherwise = case T.stripPrefix " " (T.drop 1 rest) of
+                Just v -> v
+                Nothing -> T.drop 1 rest
+       in Just (name, value)
+
+parseSseBlock :: BS.ByteString -> SseEvent
+parseSseBlock block =
+  let txt = T.replace "\r" "\n" . T.replace "\r\n" "\n" $ T.decodeUtf8Lenient block
+      ls = T.lines txt
+      fields = mapMaybe parseSseField ls
+      dataVal = T.intercalate "\n" [v | (k, v) <- fields, k == "data"]
+      typeVal = listToMaybe [v | (k, v) <- fields, k == "event"]
+      idVal = listToMaybe [v | (k, v) <- fields, k == "id"]
+   in SseEvent dataVal typeVal idVal
 
 instance FromResponseBody (StreamBody BS.ByteString) where
   fromResponseBody _ = Left "StreamBody must be built via buildResponse"
@@ -119,26 +141,27 @@ instance FromResponseBody (StreamBody SseEvent) where
 
   buildResponse llreq manager = do
     llres <- LowLevelClient.responseOpen llreq manager
-    bufRef <- newIORef ""
+    bufRef <- newIORef BS.empty
     let status = LowLevelStatus.statusCode . LowLevelClient.responseStatus $ llres
         hdrs = map (\(k, v) -> (CI.original k, v)) (LowLevelClient.responseHeaders llres)
         readNext = do
-          chunk <- LowLevelClient.brRead (LowLevelClient.responseBody llres)
-          if BS.null chunk
-            then do
-              buf <- readIORef bufRef
-              if T.null buf
-                then return Nothing
-                else
-                  case extractSseEvent buf of
-                    Just (event, rest) -> writeIORef bufRef rest >> return (Just event)
-                    Nothing -> return Nothing
-            else do
-              modifyIORef bufRef (<> T.decodeUtf8Lenient chunk)
-              buf <- readIORef bufRef
-              case extractSseEvent buf of
-                Just (event, rest) -> writeIORef bufRef rest >> return (Just event)
-                Nothing -> readNext
+          buf <- readIORef bufRef
+          case findEventSep buf of
+            Just (blockEnd, afterSep) -> do
+              writeIORef bufRef (BS.drop afterSep buf)
+              return $ Just (parseSseBlock (BS.take blockEnd buf))
+            Nothing -> do
+              chunk <- LowLevelClient.brRead (LowLevelClient.responseBody llres)
+              if BS.null chunk
+                then
+                  if BS.null buf
+                    then return Nothing
+                    else do
+                      writeIORef bufRef BS.empty
+                      return $ Just (parseSseBlock buf)
+                else do
+                  modifyIORef bufRef (<> chunk)
+                  readNext
     return $ Response status hdrs (StreamBody readNext (LowLevelClient.responseClose llres))
 
 class ToRequestBody a where
